@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
 using System;
@@ -29,6 +29,8 @@ namespace NuGet.SolutionRestoreManager
         private const int IdleTimeoutMs = 400;
         private const int RequestQueueLimit = 150;
         private const int PromoteAttemptsLimit = 150;
+        private const int DelayAutoRestoreTime = 1500;
+        private const int DelayAutoRestoreRetries = 5;
 
         private readonly IServiceProvider _serviceProvider;
         private readonly Lazy<IVsSolutionManager> _solutionManager;
@@ -339,14 +341,24 @@ namespace NuGet.SolutionRestoreManager
 
                         token.ThrowIfCancellationRequested();
 
+                        var retries = 0;
+
                         // Drains the queue
                         while (!_pendingRequests.Value.IsCompleted
                             && !token.IsCancellationRequested)
                         {
                             SolutionRestoreRequest next;
+
+                            // check if there are pending nominations
+                            var isAllProjectsNominated = _solutionManager.Value.IsAllProjectsNominated();
+
                             if (!_pendingRequests.Value.TryTake(out next, IdleTimeoutMs, token))
                             {
-                                break;
+                                if (isAllProjectsNominated)
+                                {
+                                    // if we've got all the nominations then continue with the auto restore
+                                    break;
+                                }
                             }
 
                             // Upgrade request if necessary
@@ -357,6 +369,20 @@ namespace NuGet.SolutionRestoreManager
                                 request = new SolutionRestoreRequest(
                                     next.ForceRestore || request.ForceRestore,
                                     RestoreOperationSource.Explicit);
+                            }
+
+                            if (!isAllProjectsNominated)
+                            {
+                                if (retries >= DelayAutoRestoreRetries)
+                                {
+                                    // we're still missing some nominations but don't delay it indefinitely and let auto restore fail.
+                                    break;
+                                }
+
+                                // if we're still expecting some nominations and also haven't reached our max timeout
+                                // then delay it for 1500 msec and try again.
+                                retries++;
+                                await Task.Delay(DelayAutoRestoreTime);
                             }
                         }
 
@@ -412,7 +438,7 @@ namespace NuGet.SolutionRestoreManager
         {
             var pendingTask = restoreOperation.Task;
 
-            int attempt = 0;
+            var attempt = 0;
             for (var retry = true;
                 retry && !token.IsCancellationRequested && attempt != PromoteAttemptsLimit;
                 attempt++)
